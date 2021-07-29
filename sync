@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+
+from typing import List, Optional, Union, Any, Type
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from subprocess import Popen
+from filecmp import cmp as _cmp
+
+from docopt import docopt
+
+DOC: str = r'''
+portage-rsync-pull
+
+Usage:
+    portage-rsync-pull [options]
+
+Options:
+    -t TREE, --tree TREE        local tree path [default: /var/db/repos/gentoo.mirror]
+    -m MIRROR, --mirror MIRROR  mirror URL [default: rsync://rsync.gentoo.org/gentoo-portage]
+    -f, --force                 do not check for timestamp
+    -l LOGFILE, --log LOGFILE   the log file [default: /var/log/gentoo-mirror.log]
+    -L, --no-log                do not write logs
+    -v, --verbose               run rsync with increased verbosity
+'''
+
+log_path: Optional[Path] = None
+
+def cmp(file1, file2) -> bool:
+    f1: Path = Path(file1)
+    f2: Path = Path(file2)
+    # return false if one of them do not exist
+    # return true if neither exists
+    if not (f1.exists() and f2.exists()):
+        return not (f1.exists() or f2.exists())
+    return _cmp(f1, f2)
+    
+def echoer(func):
+    def _f(*args, **kwargs) -> Any:
+        write_log(f'{func.__name__}(*args={args}, **kwargs={kwargs})')
+        return func(*args, **kwargs)
+    return _f
+
+def run_rsync(src: Path,
+              dest: Path,
+              *,
+              io_timeout: Optional[int] = None,
+              verbose: bool = False,
+              exec_verbose: bool = True) -> None:
+    '''Run rsync with some default arguments
+
+    '''
+    # function arguments
+    io: int = 180 if io_timeout is None else io_timeout
+
+    # rsync arguments
+    ARGS: List[str] = [
+        # generic arguments
+        '--recursive',          # allow recursive copy
+        '--links',              # preserve symlinks as-is
+        '--safe-links',         # only in-tree symlinks
+        '--compress',           # enable compressed traffic
+        '--force',              # force copy (override files)
+        '--perms',              # preserve source permissions
+        '--delete',             # delete extraneous files from dest dirs
+        '--whole-file',         # do not transfer partial files
+        '--times',              # preserve source modification times
+        '--omit-dir-times',     # do not preserve directory modification times
+        f'--timeout={io}',      # set I/O timeout in seconds
+        '--info=progress2',     # show progress
+        '--human-readable',     # human readable outputs
+    ]
+    # exclude from tree
+    _EXCLUDE : List[str] = [
+        '/distfiles',           # exclude distfiles
+        '/local',               # ?
+        '/packages',            # ?
+        '/.git',                # git tree
+    ]
+    ARGS += (f'--exclude={path}' for path in _EXCLUDE)
+
+    # verbosity
+    if verbose:
+        ARGS += (
+            '--verbose',        # verbose output
+            '--stats',          # file-transfer status
+        )
+
+    # start execution
+    _popen = echoer(Popen) if exec_verbose else Popen
+    proc: Popen = _popen((
+        'rsync',                # executable name
+        *ARGS,                  # global arguments
+        src,                    # source
+        dest,                   # destination
+    ))
+
+    # error checking
+    if proc.wait() != 0:
+        write_err(f'rsync(src={src},dest={dest})'
+                  'failed with ret={proc.returncode}!',
+                  exception=RuntimeError)
+
+    
+def write_log(msg: str, tee: bool = True) -> None:
+    if log_path is not None:
+        with open(log_path, 'a') as log_file:
+            from datetime import datetime
+            now: datetime = datetime.now().astimezone()
+            out_msg: str = f'[{now}] {msg}'
+            if tee: print(out_msg) # tee to stdout
+            print(out_msg, file=log_file)
+
+
+def write_err(msg: str, tee: bool = False,
+              exception: Optional[Type[Exception]] = None) -> None:
+    out_msg: str = f'[E] {msg}'
+    write_log(out_msg,
+              log_path=log_path,
+              tee=tee)
+    if exception is not None:
+        raise exception(out_msg)
+
+
+def main(*,
+         force: bool = False,
+         mirror: str,
+         local_tree: Union[Path, str],
+         verbose: bool) -> None:
+
+    write_log('Checking timestamp.')
+
+    tree: Path = Path(local_tree)
+    ts_path: str = 'metadata/timestamp.chk'
+    # first download the timestamp file
+    if not force:
+        with NamedTemporaryFile(delete = False) as f:
+            run_rsync(f'{mirror}/{ts_path}',
+                      f.name,
+                      exec_verbose=verbose)
+            
+            # compare the timestamp file with the local file
+            if cmp(f.name, tree / ts_path):
+                # timestamp not changed; safe to exit
+                write_log('Already up to date, exiting.')
+                return
+
+    # otherwise download entire tree
+    write_log('Timestamp out of date, proceeding to rsync '
+              f'the entire tree from {mirror}.')
+    run_rsync(mirror, tree, exec_verbose=verbose)
+
+    # finish
+    write_log('The download has finished.')
+
+if __name__ == '__main__':
+    args = docopt(DOC)
+    log_path = None if args['--no-log'] else args['--log']
+    main(mirror=args['--mirror'],
+         local_tree=args['--tree'],
+         force=args['--force'],
+         verbose=args['--verbose'])
